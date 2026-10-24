@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fx-visualizer"
+version = "0.1.0"
+description = "Interactive FX graphs with observed Inductor lowering and fusion boundaries"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+capture = ["torch"]
+
+[project.scripts]
+fx-visualize = "fx_visualizer.cli:main"
+
+[project.urls]
+Repository = "https://github.com/nullplay/fx-visualizer"
+
+[tool.setuptools.packages.find]
+include = ["fx_visualizer*"]
