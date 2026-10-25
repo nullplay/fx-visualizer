@@ -13,6 +13,10 @@ _VIEW_SOURCE_NAMES = {
     "view", "_unsafe_view", "permute", "expand", "squeeze", "unsqueeze",
     "alias", "detach", "slice", "select", "transpose", "t", "as_strided",
 }
+_CAST_SOURCE_TARGETS = {
+    "prims.convert_element_type.default", "aten._to_copy.default",
+    "aten.to.dtype", "aten.to.dtype_layout", "aten.type_as.default",
+}
 
 
 def _source_may_be_indexing(node):
@@ -74,6 +78,10 @@ class _ExecutionAnnotator:
         self.original = {node["id"]: node for node in capture["original_graph"]["nodes"] if not node.get("synthetic")}
         self.mm_ids = {key for key, node in self.original.items() if node.get("is_matmul")}
         self.parents = {name: self.references([node.get("args"), node.get("kwargs")]) for name, node in self.fx.items()}
+        self.children = defaultdict(set)
+        for name, parents in self.parents.items():
+            for parent in parents:
+                self.children[parent].add(name)
         self.leaves = {leaf["name"]: leaf for node in self.stage["scheduler_nodes"] for leaf in node["leaf_members"]}
         self.buffer_owners = defaultdict(set)
         self.buffer_roots = defaultdict(set)
@@ -100,6 +108,29 @@ class _ExecutionAnnotator:
                     if self.source_ids([name]) & self.mm_ids:
                         self.native_materialized_buffers.setdefault(name, set()).update(leaf["buffer_names"])
         self.annotations = {}
+        self.cast_inputs = defaultdict(list)
+        for name, node in self.fx.items():
+            args = node.get("args", [])
+            if node.get("target") != "prims.convert_element_type.default" or len(args) != 2 or not isinstance(args[1], str) or len(self.parents[name]) != 1:
+                continue
+            routes = ir_routes(self.values.get(name, {}).get("value"))
+            if len(routes) != 1 or routes[0].get("terminal_ir_type") != "Pointwise" or routes[0].get("buffer_names"):
+                continue
+            origin = routes[0]["ir_chain"][-1].get("origin_node", {})
+            if origin.get("name") != name or origin.get("graph_id") != self.graph_id:
+                continue
+            parent = self.parents[name][0]
+            inputs = ir_routes(self.values.get(parent, {}).get("value"))
+            buffers = {buffer for route in inputs for buffer in route.get("buffer_names", [])}
+            if len(buffers) != 1:
+                continue
+            ids = {key for key in self.source_ids([name]) if self.original[key].get("target") in _CAST_SOURCE_TARGETS}
+            if ids:
+                self.cast_inputs[(next(iter(buffers)), args[1])].append({
+                    "actual_fx_name": name, "input_fx_name": parent,
+                    "execution_fx_ids": ordered_ids(ids),
+                    "actual_ir_origin": {"name": name, "graph_id": self.graph_id},
+                })
 
     def references(self, value):
         if isinstance(value, dict):
@@ -180,6 +211,57 @@ class _ExecutionAnnotator:
                                    "actual_ir_origin_node": terminal["origin_node"], "output_buffer": stored[0],
                                    "loop_operations": [actual_lazy, actual_root, store],
                                    "upstream_split_buffer_boundary_warning_preserved": True})
+        return proofs
+
+    def inlined_cast_proofs(self, leaf, roots):
+        reads = {dep["name"] for dep in leaf["reads"] if not dep.get("weak")}
+        if not self.cast_inputs or not roots or leaf.get("scheduler_type") == "NopKernelSchedulerNode":
+            return []
+        proofs = []
+        for block in leaf.get("loop_ir", {}).get("blocks", []):
+            operations = {node["name"]: node for node in block["nodes"]}
+
+            def references(value):
+                if isinstance(value, dict):
+                    if value.get("name") in operations and value.get("graph_id") == block.get("graph_id"):
+                        return [value["name"]]
+                    return [name for item in value.values() for name in references(item)]
+                if isinstance(value, (list, tuple)):
+                    return [name for item in value for name in references(item)]
+                return []
+
+            stores = [node for node in operations.values() if node.get("target") in {"store", "store_reduction"}
+                      and len(loop_args(node)) >= 3 and loop_args(node)[0] in leaf["buffer_names"]]
+            pending, live = [node["name"] for node in stores], set()
+            while pending:
+                name = pending.pop()
+                if name not in live:
+                    live.add(name)
+                    pending.extend(references([operations[name].get("args", []), operations[name].get("kwargs", {})]))
+            for name in operations:
+                if name not in live:
+                    continue
+                cast = operations[name]
+                args = loop_args(cast)
+                if cast.get("target") != "to_dtype" or len(args) < 2 or not isinstance(args[0], dict) or args[0].get("name") not in live or args[0].get("graph_id") != block.get("graph_id"):
+                    continue
+                load = operations[args[0]["name"]]
+                loaded = loop_args(load)
+                if load.get("target") != "load" or not loaded or not isinstance(loaded[0], str) or loaded[0] not in reads or not isinstance(args[1], str):
+                    continue
+                for candidate in self.cast_inputs.get((loaded[0], args[1]), []):
+                    pending, visited = [candidate["actual_fx_name"]], set()
+                    while pending:
+                        actual = pending.pop()
+                        if actual in roots:
+                            proofs.append({**candidate, "input_buffer": loaded[0], "target_dtype": args[1],
+                                           "loop_operations": [load, cast],
+                                           "output_buffers": sorted(leaf["buffer_names"]),
+                                           "method": "retained lazy cast origin + actual named input load and dtype conversion on an owned store path + exact transformed FX use"})
+                            break
+                        if actual not in visited:
+                            visited.add(actual)
+                            pending.extend(self.children[actual])
         return proofs
 
     def annotate_leaf(self, name):
@@ -287,6 +369,10 @@ class _ExecutionAnnotator:
         direct_body_ids = {key for proof in direct_body_proofs for key in proof["execution_fx_ids"]}
         executed |= direct_body_ids
         unknown -= direct_body_ids
+        cast_proofs = self.inlined_cast_proofs(leaf, roots)
+        cast_ids = {key for proof in cast_proofs for key in proof["execution_fx_ids"]}
+        executed |= cast_ids
+        unknown -= cast_ids
         evidence = {"method": "walk actual transformed FX from actual loop/template roots; stop at other named materialized buffers",
                     "root_method": root_method, "actual_root_fx_names": roots,
                     "actual_loop_body_available": bool(leaf.get("loop_body")),
@@ -296,6 +382,7 @@ class _ExecutionAnnotator:
                     "own_buffer_names": sorted(own_buffers), "direct_root_fx_ids": ordered_ids(direct_ids),
                     "unknown_fx_ids": ordered_ids(unknown), "uncertainties": issues,
                     "direct_lazy_body_proofs": direct_body_proofs,
+                    "inlined_cast_proofs": cast_proofs,
                     "native_dot_reduction_proofs": native_proofs,
                     "excluded_ancestry_fx_ids": ordered_ids(set(leaf["origin_fx_ids"]) - executed - indexed),
                     "certainty": "partial" if issues else "observed IR boundaries",
@@ -404,9 +491,12 @@ class _ExecutionAnnotator:
                            "transformed_fx_names": [name for name, node in self.fx.items() if key in node.get("origin_fx_ids", [])],
                            "direct_lazy_body_proofs": [proof for annotation in self.annotations.values()
                                                        for proof in annotation["execution_evidence"]["direct_lazy_body_proofs"]
-                                                       if key in proof["execution_fx_ids"]]}
+                                                       if key in proof["execution_fx_ids"]],
+                           "inlined_cast_proofs": [proof for annotation in self.annotations.values()
+                                                   for proof in annotation["execution_evidence"]["inlined_cast_proofs"]
+                                                   if key in proof["execution_fx_ids"]]}
         self.capture["fx_status"] = status
-        self.capture["execution_annotation"] = {"version": 2, "method": "actual final IR bindings + owned intermediate buffer dependencies + actual transformed FX argument DAG + exact pre-fusion member union",
+        self.capture["execution_annotation"] = {"version": 3, "method": "actual final IR bindings + owned intermediate buffer dependencies + captured lazy cast dataflow + actual transformed FX argument DAG + exact pre-fusion member union",
                                                 "never_use_origin_sets_as_execution": True, "original_indexing_fx_ids": ordered_ids(self.original_indexing),
                                                 "unknown_original_compute_fx_ids": ordered_ids(key for key, value in status.items() if value["role"] == "unknown"),
                                                 "not_an_exclusive_partition": True}

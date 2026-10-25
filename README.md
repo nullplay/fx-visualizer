@@ -62,8 +62,13 @@ keyword-only.
 
 The screenshot shows `op1` selected in the ReLU/mean pattern:
 
-- **Solid boundaries** show lowering groups; **dashed boundaries** show fused
-  scheduler groups. Broad rounded envelopes keep the directed graph readable.
+- **Solid boundaries** show lowering groups; **dashed boundaries** show every
+  scheduler node remaining after fusion, including standalone nodes of every
+  class. Broad rounded envelopes keep the directed graph readable.
+- The after-fusion list shows each scheduler's class and MM count. Select a row
+  to highlight its exact FX members and constituent lowering groups. MM labels
+  count computation contributors; incidental nodes inside an envelope do not
+  count. A scheduler without mapped FX members has a separate dashed marker.
 - `op0` performs ReLU and the mean's sum reduction. `op1` reads that result,
   divides by `13 * 13 = 169` and converts the dtype. Both correspond to the same
   original `mean` FX node; only `op0` performs ReLU.

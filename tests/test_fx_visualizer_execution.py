@@ -102,6 +102,47 @@ def split_mean_capture():
     }
 
 
+def native_bias_cast_capture():
+    capture = split_mean_capture()
+    stage = capture["stages"]["lowering"]
+    capture["original_graph"]["nodes"][2].update(target="aten.addmm.default", is_matmul=True)
+    capture["original_graph"]["nodes"].extend([
+        {"id": "n5", "fx_name": "bias", "fx_op": "placeholder", "target": "bias", "is_matmul": False},
+        {"id": "n6", "fx_name": "bias_cast", "fx_op": "call_function", "target": "prims.convert_element_type.default", "is_matmul": False},
+    ])
+    stage["transformed_fx"][2].update(target="aten.addmm.default", args=[fx_ref("bias_cast"), fx_ref("relu"), fx_ref("x")])
+    stage["transformed_fx"].extend([
+        {"name": "bias", "op": "placeholder", "target": "bias", "origin_fx_ids": ["n5"], "args": [], "kwargs": {}},
+        {"name": "bias_cast", "op": "call_function", "target": "prims.convert_element_type.default", "origin_fx_ids": ["n6"], "args": [fx_ref("bias"), "torch.bfloat16"], "kwargs": {}},
+    ])
+    stage["final_ir_values"].extend([
+        {"fx": fx_ref(name), "value": {
+            "ir_chain": [{"type": kind, "origin_node": fx_ref(name)}],
+            "terminal_ir_type": kind, "buffer_names": buffers, "contains_view": False,
+        }} for name, kind, buffers in (("bias", "InputBuffer", ["arg1_1"]), ("bias_cast", "Pointwise", []))
+    ])
+    producer, consumer, _ = stage["scheduler_nodes"]
+    producer["leaf_members"][0].update(is_native_matmul=True, reduction_type="dot")
+    producer["leaf_members"][0]["loop_ir"]["blocks"][0]["nodes"] = [
+        loop_operation("load", "load", "arg0_1", 0),
+        loop_operation("relu", "relu", {"name": "load"}),
+        loop_operation("dot", "dot", {"name": "relu"}, {"name": "load"}),
+        loop_operation("reduce", "reduction", "float32", "float32", "dot", {"name": "dot"}),
+        loop_operation("store", "store_reduction", "buf0", 0, {"name": "reduce"}),
+    ]
+    leaf = consumer["leaf_members"][0]
+    leaf["reads"].append({"name": "arg1_1"})
+    leaf["loop_ir"]["blocks"][0]["nodes"] = [
+        loop_operation("load", "load", "buf0", 0),
+        loop_operation("bias_load", "load", "arg1_1", 0),
+        loop_operation("bias_cast", "to_dtype", {"name": "bias_load"}, "torch.bfloat16"),
+        loop_operation("add", "add", {"name": "load"}, {"name": "bias_cast"}),
+        loop_operation("store", "store", "buf1", 0, {"name": "add"}),
+    ]
+    capture["stages"]["fusion"]["scheduler_nodes"][0]["leaf_members"] = [copy.deepcopy(node["leaf_members"][0]) for node in stage["scheduler_nodes"]]
+    return capture
+
+
 class TestSchedulerExecution(unittest.TestCase):
     def test_mean_split_preserves_shared_mean_without_repeating_relu(self):
         capture = split_mean_capture()
@@ -243,10 +284,62 @@ class TestSchedulerExecution(unittest.TestCase):
         self.assertEqual(fused["matmul_leaf_count"], 1)
         self.assertEqual(fused["native_original_mm_ids"], ["n2"])
 
+    def test_native_bias_cast_belongs_to_epilogue_and_not_dot_reduction(self):
+        capture = native_bias_cast_capture()
+        annotate_scheduler_execution(capture)
+        producer, epilogue, _ = capture["stages"]["lowering"]["scheduler_nodes"]
+        self.assertNotIn("n6", producer["execution_fx_ids"])
+        self.assertEqual(epilogue["execution_fx_ids"], ["n6"])
+        self.assertEqual(epilogue["native_matmul_leaf_count"], 0)
+        self.assertEqual(capture["fx_status"]["n6"]["lowering"], ["op1"])
+        proof = capture["fx_status"]["n6"]["inlined_cast_proofs"][0]
+        self.assertEqual(proof["actual_fx_name"], "bias_cast")
+        self.assertEqual(proof["input_buffer"], "arg1_1")
+        self.assertEqual(proof["target_dtype"], "torch.bfloat16")
+        self.assertEqual(proof["output_buffers"], ["buf1"])
+        fused = capture["stages"]["fusion"]["scheduler_nodes"][0]
+        self.assertIn("n6", fused["execution_fx_ids"])
+        self.assertEqual(fused["matmul_leaf_count"], 1)
+        before = copy.deepcopy(capture)
+        annotate_scheduler_execution(capture)
+        self.assertEqual(capture, before)
+
+    def test_inlined_cast_requires_exact_input_dtype_origin_use_and_store_path(self):
+        for case in ("no_conversion", "different_dtype", "different_buffer", "weak_read", "unused_conversion", "foreign_ir_origin", "materialized_cast", "unrelated_fx_root", "foreign_loop_reference", "missing_input_binding"):
+            with self.subTest(case=case):
+                capture = native_bias_cast_capture()
+                stage = capture["stages"]["lowering"]
+                leaf = stage["scheduler_nodes"][1]["leaf_members"][0]
+                operations = leaf["loop_ir"]["blocks"][0]["nodes"]
+                if case == "no_conversion":
+                    operations[2]["target"] = "neg"
+                elif case == "different_dtype":
+                    operations[2]["args"][-1] = "torch.float32"
+                elif case == "different_buffer":
+                    operations[1]["args"][1] = "other_buffer"
+                elif case == "weak_read":
+                    leaf["reads"][-1]["weak"] = True
+                elif case == "unused_conversion":
+                    operations[3]["args"][-1] = {"name": "load"}
+                elif case == "foreign_ir_origin":
+                    stage["final_ir_values"][-1]["value"]["ir_chain"][-1]["origin_node"]["graph_id"] = "other-stage"
+                elif case == "materialized_cast":
+                    stage["final_ir_values"][-1]["value"]["buffer_names"] = ["cast_buffer"]
+                elif case == "unrelated_fx_root":
+                    leaf["origin_node"] = fx_ref("compare")
+                    leaf["data_origins"] = [fx_ref("compare")]
+                elif case == "foreign_loop_reference":
+                    operations[2]["args"][1]["graph_id"] = "other-loop"
+                else:
+                    stage["final_ir_values"][-2]["value"] = None
+                annotate_scheduler_execution(capture)
+                self.assertNotIn("n6", stage["scheduler_nodes"][1]["execution_fx_ids"])
+                self.assertEqual(leaf["execution_evidence"]["inlined_cast_proofs"], [])
+
     def test_offline_replay_refreshes_stale_membership_outside_scheduler_preview(self):
         capture = split_mean_capture()
         capture["compile"]["mode"] = "compiled"
-        capture["execution_annotation"] = {"version": 1}
+        capture["execution_annotation"] = {"version": 2}
         for node in capture["stages"]["lowering"]["scheduler_nodes"]:
             node.update(execution_fx_ids=node["leaf_members"][0]["origin_fx_ids"], indexing_fx_ids=[])
         capture["stages"]["fusion"]["scheduler_nodes"][0].update(execution_fx_ids=["n1", "n2", "n3"], indexing_fx_ids=[])
@@ -258,7 +351,7 @@ class TestSchedulerExecution(unittest.TestCase):
             }) as layout, patch("fx_visualizer.rendering._build_widget", return_value="<section>Viewer</section>"):
                 result = render_capture(capture=source, output_dir=Path(temporary) / "replay")
             replay = json.loads(Path(result["capture"]).read_text())
-            self.assertEqual(replay["execution_annotation"]["version"], 2)
+            self.assertEqual(replay["execution_annotation"]["version"], 3)
             self.assertEqual(replay["stages"]["lowering"]["scheduler_nodes"][1]["execution_fx_ids"], ["n2"])
             self.assertEqual(layout.call_args.args[0]["stages"]["lowering"]["scheduler_nodes"][1]["execution_fx_ids"], ["n2"])
             self.assertEqual(json.loads(source.read_text()), capture)

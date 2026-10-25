@@ -125,6 +125,7 @@ def _members(node, order):
 def _regions(capture):
     original = capture["original_graph"]
     order = {node["id"]: i for i, node in enumerate(original["nodes"])}
+    matmul_ids = {node["id"] for node in original["nodes"] if node.get("is_matmul") or node.get("kind") == "mm"}
     lowering = []
     for i, node in enumerate(capture["stages"]["lowering"]["scheduler_nodes"]):
         members, unknown = _members(node, order)
@@ -133,6 +134,7 @@ def _regions(capture):
             "id": node["id"], "svg_id": f"lowering-region-{i}", "label": node.get("name", node["id"]),
             "member_fx_ids": members, "execution_fx_ids": list(node.get("execution_fx_ids", [])),
             "indexing_fx_ids": list(node.get("indexing_fx_ids", [])),
+            "matmul_fx_ids": [key for key in members if key in matmul_ids and key in node.get("execution_fx_ids", [])],
             "member_operation_names": list(node.get("member_operation_names", [node["id"]])),
             "unknown_fx_ids": sorted(set(unknown + evidence.get("unknown_fx_ids", []))),
             "source_evidence": evidence, "certainty": evidence.get("certainty", "not annotated"),
@@ -156,8 +158,6 @@ def _regions(capture):
                 if group not in destination:
                     destination.append(group)
         accepted_result = [event for event in accepted if event.get("result") == node["id"]]
-        if len(children) < 2 and not accepted_result:
-            continue
         members, unknown = _members(node, order)
         declared_members = members
         if children:
@@ -167,6 +167,7 @@ def _regions(capture):
             "id": node["id"], "svg_id": f"fusion-region-{len(fusion)}", "label": node.get("name", node["id"]),
             "member_fx_ids": members, "declared_member_fx_ids": declared_members,
             "execution_fx_ids": list(node.get("execution_fx_ids", [])), "indexing_fx_ids": list(node.get("indexing_fx_ids", [])),
+            "matmul_fx_ids": [key for key in members if key in matmul_ids and key in node.get("execution_fx_ids", [])],
             "lowering_members": [group["id"] for group in children],
             "partial_lowering_members": [group["id"] for group in partial_children],
             "member_operation_names": operations,
@@ -367,6 +368,14 @@ def _contours(nodes, lowering, fusion):
     for group in fusion:
         children = [lower_by_id[key] for key in group["lowering_members"]]
         group.update(_outer_contour(group, nodes, children))
+    points = [point for node in nodes for point in _corners(node["bbox"])]
+    points.extend(point for group in [*lowering, *fusion] for ring in group["rings"] for point in ring)
+    right, top = max(point[0] for point in points) + 48, min(point[1] for point in points)
+    for i, group in enumerate(group for group in fusion if not group["path"]):
+        box = {"x": right, "y": top + i * 74, "width": 216, "height": 42}
+        group.update(_smooth([_corners(box)], 12))
+        group["geometry_status"] = "unmapped_or_empty"
+        group["contour_method"] = "unmapped scheduler marker"
 
 
 def _audit(nodes, lowering, fusion):
@@ -403,6 +412,13 @@ def _audit(nodes, lowering, fusion):
     return {"full_member_inclusion": inclusion, "nonmember_intersections": intersections, "incidental_enclosed": enclosed, "incidental_boundary_intersections": crossed, "nonmember_overlap_allowed": True, "smooth_outer_envelopes": envelopes, "whole_lowering_contours_inside_fusion": nested, "passed": True}
 
 
+def _region_label(group):
+    label = str(group["label"])
+    suffix = " | no FX" if group.get("geometry_status") == "unmapped_or_empty" else (f" | MM {len(group['matmul_fx_ids'])}" if "lowering_members" in group or group.get("matmul_fx_ids") else "")
+    limit = 26 - len(suffix)
+    return (label if len(label) <= limit else label[:limit - 3] + "...") + suffix
+
+
 def _place_labels(nodes, groups):
     labels = []
     for group in groups:
@@ -410,7 +426,7 @@ def _place_labels(nodes, groups):
             group["label_bbox"], group["label_center"] = None, None
             continue
         box = group["bbox"]
-        width, height = min(180, max(28, len(str(group["label"])) * 6)), 15
+        width, height = min(180, max(28, len(_region_label(group)) * 6)), 15
         candidates = [(box["x"] + width / 2, box["y"] - 10), (box["x"] + box["width"] - width / 2, box["y"] - 10), (box["x"] + width / 2, box["y"] + box["height"] + 11)]
         for node in nodes:
             if node["id"] in group["member_fx_ids"]:
@@ -431,12 +447,12 @@ def _svg(payload, *, id_prefix=""):
     svg_id = lambda value: attr(id_prefix + value)
     view_box = " ".join(str(v) for v in payload["view_box"])
     x, y, w, h = payload["view_box"]
-    chunks = [f'<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="{svg_id("scheduler-region-title")} {svg_id("scheduler-region-desc")}" viewBox="{view_box}" style="background:{_BACKGROUND};color:{_FOREGROUND}">', f'<title id="{svg_id("scheduler-region-title")}">Original FX with observed scheduler regions</title>', f'<desc id="{svg_id("scheduler-region-desc")}">The original directed FX graph is preserved. Solid broad convex envelopes show lowering groups; thicker dashed envelopes enclose their actual fused groups. Envelopes may also contain unrelated nodes. Select a boundary to highlight only its exact computation and indexing contributors. Shared contributors may belong to more than one group. Missing mappings are explicit in the accompanying payload.</desc>', f'<rect x="{_number(x)}" y="{_number(y)}" width="{_number(w)}" height="{_number(h)}" fill="{_BACKGROUND}"/>', f'<g id="{svg_id("fx-region-scene")}" data-scheduler-region-scene="true">', f'<g id="{svg_id("scheduler-region-boundaries")}">']
+    chunks = [f'<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="{svg_id("scheduler-region-title")} {svg_id("scheduler-region-desc")}" viewBox="{view_box}" style="background:{_BACKGROUND};color:{_FOREGROUND}">', f'<title id="{svg_id("scheduler-region-title")}">Original FX with observed scheduler regions</title>', f'<desc id="{svg_id("scheduler-region-desc")}">The original directed FX graph is preserved. Solid broad convex envelopes show lowering groups. Every scheduler node remaining after fusion has one thicker dashed envelope, including standalone nodes of every class. Envelopes may also contain unrelated nodes. Select a boundary to highlight only its exact computation and indexing contributors. Shared contributors may belong to more than one group. Nodes without mapped FX members have separate dashed markers.</desc>', f'<rect x="{_number(x)}" y="{_number(y)}" width="{_number(w)}" height="{_number(h)}" fill="{_BACKGROUND}"/>', f'<g id="{svg_id("fx-region-scene")}" data-scheduler-region-scene="true">', f'<g id="{svg_id("scheduler-region-boundaries")}">']
     for fused, groups in ((False, payload["lowering_groups"]), (True, payload["fusion_groups"])):
         for group in groups:
             cls = "fusion-boundary" if fused else "lowering-boundary"
             dash = ' stroke-dasharray="11 6"' if fused else ""
-            chunks.append(f'<g id="{svg_id(group["svg_id"])}" class="{cls}" data-scheduler="{attr(group["id"])}" data-fx-ids="{attr(" ".join(group["member_fx_ids"]))}"><title>{attr(group["id"])}: computation {attr(", ".join(group["execution_fx_ids"]))}; indexing {attr(", ".join(group["indexing_fx_ids"]))}; {attr(group["geometry_status"])}</title>')
+            chunks.append(f'<g id="{svg_id(group["svg_id"])}" class="{cls}" data-scheduler="{attr(group["id"])}" data-scheduler-class="{attr(group.get("class") or group.get("scheduler_type") or "")}" data-fx-ids="{attr(" ".join(group["member_fx_ids"]))}"><title>{attr(group["id"])}: {attr(group.get("class") or group.get("scheduler_type") or "")}; MM {attr(", ".join(group.get("matmul_fx_ids", [])))}; computation {attr(", ".join(group["execution_fx_ids"]))}; indexing {attr(", ".join(group["indexing_fx_ids"]))}; {attr(group["geometry_status"])}</title>')
             if group["path"]:
                 chunks.append(f'<path d="{group["path"]}" fill="{group["color"]}" fill-rule="{group["fill_rule"]}" fill-opacity="{0.025 if fused else 0.075}" stroke="{group["color"]}" stroke-width="{3.6 if fused else 2.1}"{dash} vector-effect="non-scaling-stroke"/>')
             chunks.append("</g>")
@@ -469,7 +485,7 @@ def _svg(payload, *, id_prefix=""):
                 cx, cy = group["label_center"]
                 cls = "fusion-boundary" if fused else "lowering-boundary"
                 label = str(group["label"])
-                visible = label if len(label) <= 26 else label[:23] + "..."
+                visible = _region_label(group)
                 chunks.append(f'<g class="{cls} region-label" data-scheduler="{attr(group["id"])}"><title>{attr(label)}</title><rect x="{_number(box["x"])}" y="{_number(box["y"])}" width="{_number(box["width"])}" height="{_number(box["height"])}" rx="3" fill="{_BACKGROUND}" fill-opacity="0.9"/><text x="{_number(cx)}" y="{_number(cy + 4)}" text-anchor="middle" fill="{group["color"]}" font-family="Arial,sans-serif" font-size="11" font-weight="700">{html.escape(visible)}</text></g>')
     chunks.append("</g></g></svg>")
     return "\n".join(chunks)
@@ -499,10 +515,17 @@ def layout_regions(capture: dict, output_dir: Path, *, clustered=True) -> dict:
     _place_labels(nodes, [*lowering, *fusion])
     computation = {key for group in lowering for key in group["execution_fx_ids"]}
     indexing = set(capture.get("execution_annotation", {}).get("original_indexing_fx_ids", [])) | {key for group in lowering for key in group["indexing_fx_ids"]}
+    inlined_cast_owners = defaultdict(set)
+    for group in lowering:
+        for evidence in group["source_evidence"].get("member_evidence", {}).values():
+            for proof in evidence.get("inlined_cast_proofs", []):
+                for key in proof["execution_fx_ids"]:
+                    inlined_cast_owners[key].add(group["id"])
     for node in nodes:
         key = node["id"]
         node["lowering_groups"] = [group["id"] for group in lowering if key in group["member_fx_ids"]]
         node["fusion_groups"] = [group["id"] for group in fusion if key in group["member_fx_ids"]]
+        node["inlined_cast_schedulers"] = sorted(inlined_cast_owners[key])
         node["indexing_only"] = key in indexing and key not in computation
         node["contribution_kind"] = "computation_and_indexing" if key in computation and key in indexing else ("computation" if key in computation else ("indexing" if key in indexing else "unassigned_or_graph_boundary"))
     points = [p for node in nodes for p in _corners(node["bbox"])]

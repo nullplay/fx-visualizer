@@ -35,6 +35,19 @@ Template candidate construction may still render candidate source during lowerin
 
 The returned dictionary includes `html`, `svg`, `widget`, `payload`, `capture`,
 `lowering_count`, `after_fusion_count`, and `fusion_region_count`.
+`fusion_region_count` counts all scheduler nodes remaining after fusion,
+including unchanged nodes of every class. The payload's `fusion_groups` contains
+one entry per final scheduler. Each group includes its class and `matmul_fx_ids`
+from computation membership. Unmapped final schedulers receive separate dashed
+markers without assigning them FX members.
+
+Casts can materialize as standalone scheduler nodes or execute inline in a
+larger pointwise body. Inlined casts are associated with the scheduler that
+actually loads and converts their input, including native matmul epilogues.
+`fx_status[fx_id]["inlined_cast_proofs"]` retains the named input, target dtype,
+exact lazy IR origin and captured load/conversion operations. The node inspector
+shows the owning lowering schedulers. Matmul finalization does not count as a
+second dot computation.
 
 ## Matmul comparison
 

@@ -45,6 +45,11 @@ _STYLE = """
 .fx-regions .arguments summary{cursor:pointer;overflow-wrap:anywhere}
 .fx-regions .arguments details{margin-top:8px}
 .fx-regions .arguments pre{font:12px/1.45 ui-monospace,monospace;white-space:pre-wrap;max-height:240px;overflow:auto}
+.fx-regions .scheduler-list{margin-top:10px;overflow-x:auto}
+.fx-regions .scheduler-list table{width:100%;border-collapse:collapse;font-size:12px}
+.fx-regions .scheduler-list th,.fx-regions .scheduler-list td{text-align:left;padding:5px 4px;border-bottom:1px solid var(--widget-border,#d1d5db);overflow-wrap:anywhere}
+.fx-regions .scheduler-list button{font-size:12px;text-align:left;overflow-wrap:anywhere}
+.fx-regions .scheduler-list button[aria-pressed="true"]{background:var(--widget-accent,#6366f1);color:var(--widget-on-accent,#ffffff)}
 .fx-regions .foot{justify-content:space-between;margin-top:7px}
 .fx-regions .load-message{padding:16px;color:var(--widget-muted,#6b7280)}
 @media(min-width:1000px){.fx-regions .workspace{grid-template-columns:minmax(0,1fr) 320px;height:clamp(340px,calc(100dvh - 200px),700px)}.fx-regions .viewport{height:100%;min-height:0}.fx-regions .inspector{min-height:0;overflow:auto}}
@@ -65,6 +70,7 @@ function initializeViewer(root,decoded){
   const key=g=>g.stage+':'+g.id;
   const groupMap=new Map(groups.map(g=>[key(g),g]));
   const regionElements=new Map();
+  const schedulerButtons=new Map();
   for(const stage of ['lowering','fusion'])root.querySelectorAll('.'+stage+'-boundary').forEach(e=>{
    const id=stage+':'+e.dataset.scheduler;
    if(!regionElements.has(id))regionElements.set(id,[]);
@@ -104,6 +110,7 @@ function initializeViewer(root,decoded){
    }
    nodeElements.forEach((element,id)=>element.style.opacity=spotlight&&!members.has(id)?'0.16':'');
    edgeElements.forEach(element=>element.style.opacity=spotlight&&!(members.has(element.dataset.source)&&members.has(element.dataset.target))?'0.12':'');
+   schedulerButtons.forEach((button,id)=>button.setAttribute('aria-pressed',String(selected?.kind==='group'&&selected.id===id)));
   }
   function clear(){
    selected=null;
@@ -118,7 +125,7 @@ function initializeViewer(root,decoded){
   }
   function initialDetail(){
    showDetail('Original FX and observed scheduler groups',data.summary,
-    'Solid: lowering; thick dashed: observed fusion\nBroad envelopes; click to highlight exact members\nSelecting fusion also highlights its lowering boundaries and labels\nClick the same boundary or label again to restore all groups\nClick a node to inspect computation/indexing; select a group to zoom'+(data.capture_note?'\n'+data.capture_note:'')+(data.partial_count?'\npartial '+data.partial_count+' partial groups: only observed membership is displayed.':''));
+    'Solid: lowering; thick dashed: every scheduler node after fusion\nBroad envelopes; click to highlight exact members\nAfter-fusion selection also highlights its lowering boundaries and labels\nClick the same boundary or label again to restore all groups\nClick a node to inspect computation/indexing; select a group to zoom'+(data.capture_note?'\n'+data.capture_note:'')+(data.partial_count?'\npartial '+data.partial_count+' partial groups: only observed membership is displayed.':''));
   }
   function resetSelection(){clear();initialDetail();layers();}
   function contribution(group,id){
@@ -132,9 +139,11 @@ function initializeViewer(root,decoded){
    boundaryIds(id).forEach(key=>regionElements.get(key)?.forEach(e=>e.classList.add('chosen-region')));
    root.querySelector('[data-group-select="'+group.stage+'"]').value=id;
    const fused=group.stage==='fusion';
-   const heading=fused?'Fusion: '+group.lowering_members.join(' + ')+' → '+group.id:'Lowering: '+group.id;
-   const summary=[group.execution_fx_ids.length+' compute',group.indexing_fx_ids.length+' indexing',group.codegen_backend||group.scheduler_type||'',group.certainty==='partial'?'partial':'',group.geometry_status==='disconnected'?'shown as multiple boundaries':''].filter(Boolean).join(' · ');
+   const heading=(fused?'After fusion: ':'Lowering: ')+group.id;
+   const summary=[group.class||group.scheduler_type||'',(group.matmul_fx_ids||[]).length+' MM',group.execution_fx_ids.length+' compute',group.indexing_fx_ids.length+' indexing',group.codegen_backend||'',group.certainty==='partial'?'partial':'',group.geometry_status==='unmapped_or_empty'?'no mapped FX members':'',group.geometry_status==='disconnected'?'shown as multiple boundaries':''].filter(Boolean).join(' · ');
    const extra=group.member_fx_ids.map(n=>n+' · '+(nodes.get(n)?.target||'')+' ['+contribution(group,n)+']');
+   if(group.matmul_fx_ids?.length)extra.unshift('MM members: '+group.matmul_fx_ids.join(', '));
+   if(fused)extra.unshift('Lowering members: '+group.lowering_members.join(', '));
    if(group.incidental_enclosed_fx_ids?.length)extra.push('Incidental nonmembers inside the envelope: '+group.incidental_enclosed_fx_ids.join(', '));
    if(group.unknown_fx_ids?.length)extra.push('Unresolved membership: '+group.unknown_fx_ids.join(', '));
    showDetail(heading,summary,extra.join('\n'));
@@ -150,9 +159,10 @@ function initializeViewer(root,decoded){
    nodeElements.get(id)?.classList.add('chosen');
    const related=groups.filter(g=>g.member_fx_ids.includes(id));
    related.forEach(g=>regionElements.get(key(g))?.forEach(e=>e.classList.add('chosen-region')));
-   const descriptions=related.map(g=>(g.stage==='lowering'?'Lowering':'Fusion')+' '+contribution(g,id)+': '+g.id+(g.certainty==='partial'?' [partial]':''));
+   const descriptions=related.map(g=>(g.stage==='lowering'?'Lowering':'After fusion')+' '+contribution(g,id)+': '+g.id+(g.certainty==='partial'?' [partial]':''));
    const geometry=node.geometry||node;
    const extra=[node.fx_name?'FX name: '+node.fx_name:'',node.source_name?'source: '+node.source_name:''];
+   if(node.inlined_cast_schedulers?.length)extra.push('Inlined cast in lowering schedulers: '+node.inlined_cast_schedulers.join(', '));
    if(node.geometry)extra.push('Geometry: '+JSON.stringify(node.geometry,null,2));
    else if(geometry.shape)extra.push('shape: '+JSON.stringify(geometry.shape));
    if(node.actual_args)extra.push('Arguments: '+JSON.stringify(node.actual_args,null,2));
@@ -172,11 +182,20 @@ function initializeViewer(root,decoded){
    const select=root.querySelector('[data-group-select="'+stage+'"]');
    for(const group of groups.filter(g=>g.stage===stage)){
     const option=document.createElement('option');option.value=key(group);
-    option.textContent=group.id+' · '+group.execution_fx_ids.length+' compute / '+group.indexing_fx_ids.length+' indexing'+(group.certainty==='partial'?' [partial]':'')+(group.codegen_backend?' · '+group.codegen_backend:'');
+    option.textContent=group.id+' · '+(group.class||group.scheduler_type||'')+' · MM '+(group.matmul_fx_ids||[]).length+' · '+group.execution_fx_ids.length+' compute / '+group.indexing_fx_ids.length+' indexing'+(group.certainty==='partial'?' [partial]':'')+(group.codegen_backend?' · '+group.codegen_backend:'');
     select.appendChild(option);
    }
    select.disabled=!groups.some(g=>g.stage===stage);
    select.addEventListener('change',()=>{if(select.value)selectGroup(select.value);else resetSelection();});
+  }
+  const schedulerList=root.querySelector('[data-scheduler-list]');
+  for(const group of groups.filter(g=>g.stage==='fusion')){
+   const row=document.createElement('tr'),name=document.createElement('td'),type=document.createElement('td'),mm=document.createElement('td'),button=document.createElement('button');
+   button.type='button';button.textContent=group.id;button.setAttribute('aria-pressed','false');
+   button.addEventListener('click',()=>selectGroup(key(group),{spotlight:true}));
+   schedulerButtons.set(key(group),button);name.appendChild(button);
+   type.textContent=group.class||group.scheduler_type||'unspecified';mm.textContent=(group.matmul_fx_ids||[]).length;
+   row.append(name,type,mm);schedulerList.appendChild(row);
   }
   root.querySelectorAll('[data-layer],[data-only]').forEach(e=>e.addEventListener('change',layers));
   root.querySelector('[data-action="fit"]').addEventListener('click',fitAll);
@@ -187,7 +206,7 @@ function initializeViewer(root,decoded){
    if(!groupMap.get(id).bbox)return;
    elements.forEach(element=>{
     element.setAttribute('tabindex','0');element.setAttribute('role','button');
-    element.setAttribute('aria-label',(groupMap.get(id).stage==='lowering'?'Lowering':'Fusion')+' '+groupMap.get(id).id+' focus boundary or restore');
+    element.setAttribute('aria-label',(groupMap.get(id).stage==='lowering'?'Lowering':'After fusion')+' '+groupMap.get(id).id+' focus boundary or restore');
     element.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){if(!event.repeat)toggleBoundary(id);event.preventDefault();event.stopPropagation();}});
     element.addEventListener('click',event=>{if(event.detail===0){toggleBoundary(id);event.stopPropagation();}});
    });
@@ -293,13 +312,13 @@ def _widget_parts(payload, title, post_count, *, compile_info=None, matmul_lower
     from .regions import _svg
 
     svg = _svg(payload, id_prefix=root_id + "-")
-    node_fields = ("id", "kind", "fx_name", "fx_op", "target", "label", "source_name", "shape", "stride", "dtype", "geometry", "bbox", "is_matmul", "actual_args", "actual_kwargs", "output_ports")
-    group_fields = ("id", "member_fx_ids", "execution_fx_ids", "indexing_fx_ids", "lowering_members", "incidental_enclosed_fx_ids", "incidental_intersected_fx_ids", "bbox", "certainty", "unknown_fx_ids", "geometry_status", "scheduler_type", "codegen_backend")
+    node_fields = ("id", "kind", "fx_name", "fx_op", "target", "label", "source_name", "shape", "stride", "dtype", "geometry", "bbox", "is_matmul", "inlined_cast_schedulers", "actual_args", "actual_kwargs", "output_ports")
+    group_fields = ("id", "member_fx_ids", "execution_fx_ids", "indexing_fx_ids", "matmul_fx_ids", "lowering_members", "incidental_enclosed_fx_ids", "incidental_intersected_fx_ids", "bbox", "certainty", "unknown_fx_ids", "geometry_status", "class", "scheduler_type", "codegen_backend")
     lowering = payload["lowering_groups"]
     fused = payload["fusion_groups"]
     partial_count = sum(group.get("certainty") == "partial" for group in lowering)
     matmul_count = sum(bool(node.get("is_matmul") or node.get("kind") == "mm") for node in payload["nodes"])
-    summary = f"Matmul {matmul_count} | Lowering {len(lowering)} -> After fusion {post_count} | Fusion boundaries {len(fused)}"
+    summary = f"Matmul {matmul_count} | Lowering {len(lowering)} -> After fusion {post_count} | After-fusion boundaries {len(fused)}"
     capture_note = ""
     if (compile_info or {}).get("mode") == "schedule_only":
         capture_note = "Scheduler preview: untuned candidates and heuristic fusion; no final GPU compilation, autotuning or execution"
@@ -327,7 +346,7 @@ def _widget_parts(payload, title, post_count, *, compile_info=None, matmul_lower
  <div class="muted">{html.escape(capture_note)}</div>
  <div class="controls">
   <label><input type="checkbox" data-layer="lowering" checked>Lowering boundaries</label>
-  <label><input type="checkbox" data-layer="fusion" checked>Fusion boundaries</label>
+  <label><input type="checkbox" data-layer="fusion" checked>After fusion boundaries</label>
   <label><input type="checkbox" data-only>Selected boundaries only</label>
   <button type="button" data-action="in" aria-label="Zoom in">+</button>
   <button type="button" data-action="out" aria-label="Zoom out">-</button>
@@ -336,16 +355,17 @@ def _widget_parts(payload, title, post_count, *, compile_info=None, matmul_lower
  </div>
  <div class="controls">
   <label>Lowering <select data-group-select="lowering"><option value="">Select group / zoom</option></select></label>
-  <label>Fusion <select data-group-select="fusion"><option value="">Select group / zoom</option></select></label>
+  <label>After fusion <select data-group-select="fusion"><option value="">Select group / zoom</option></select></label>
  </div>
  <div class="workspace">
   <div class="viewport"><div class="load-message">Loading graph...</div></div>
   <aside class="inspector" aria-label="FX node and scheduler inspector">
    <div class="detail" aria-live="polite"><strong class="detail-title">Observed scheduler boundaries</strong><div class="detail-summary">{html.escape(summary)}</div><pre class="detail-extra"></pre></div>
+   <div class="scheduler-list"><strong>After fusion: {len(fused)} scheduler nodes</strong><table><thead><tr><th scope="col">Scheduler</th><th scope="col">Class</th><th scope="col">MM</th></tr></thead><tbody data-scheduler-list></tbody></table></div>
    <details class="arguments"><summary>FX input and output arguments</summary><div data-arguments></div></details>
   </aside>
  </div>
- <div class="foot muted"><span>Solid: lowering; thick dashed: fusion; broad envelopes</span><span>Fusion highlights child lowering groups; click again to restore; scroll to zoom; drag to pan</span></div>
+ <div class="foot muted"><span>Solid: lowering; one thick dashed boundary per scheduler after fusion</span><span>Select a scheduler to highlight exact FX members and child lowering groups; scroll to zoom; drag to pan</span></div>
 </section>
 """
     heading = f'<h2 class="sr-only">{safe_title} original FX and lowering/fusion boundaries</h2>'
@@ -402,7 +422,7 @@ def render_capture(*, capture, output_dir, title=None, clustered=True):
     saved_schedule = capture.get("compile", {}).get("mode") == "schedule_only" and any(
         "loop_ir" in leaf for node in capture["stages"]["lowering"]["scheduler_nodes"] for leaf in node.get("leaf_members", [])
     )
-    stale_annotation = capture.get("execution_annotation", {}).get("version", 0) < 2 and bool(capture["stages"]["lowering"].get("final_ir_values"))
+    stale_annotation = capture.get("execution_annotation", {}).get("version", 0) < 3 and bool(capture["stages"]["lowering"].get("final_ir_values"))
     if saved_schedule or stale_annotation or (not capture.get("execution_annotation") and any("execution_fx_ids" not in node or "indexing_fx_ids" not in node for node in groups)):
         from .execution import annotate_scheduler_execution
 

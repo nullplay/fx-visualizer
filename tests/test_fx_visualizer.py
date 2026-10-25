@@ -395,12 +395,69 @@ class TestSchedulerVisualization(unittest.TestCase):
         self.assertEqual(saved, json.loads(json.dumps(self.payload)))
         self.assertTrue((Path(self.output.name) / "original_fx_regions.svg").is_file())
 
-    def test_unchanged_multi_operation_scheduler_node_is_not_new_fusion(self):
+    def test_unchanged_multi_operation_scheduler_keeps_boundary_without_new_fusion(self):
         capture = copy.deepcopy(self.capture)
         for stage in ("lowering", "fusion"):
             capture["stages"][stage]["scheduler_nodes"][0]["member_operation_names"].append("existing-second-leaf")
         payload = layout_regions(capture, Path(self.output.name) / "unchanged")
-        self.assertEqual([group["id"] for group in payload["fusion_groups"]], ["unrelated-fused-name"])
+        self.assertEqual([group["id"] for group in payload["fusion_groups"]], [node["id"] for node in capture["stages"]["fusion"]["scheduler_nodes"]])
+        unchanged = next(group for group in payload["fusion_groups"] if group["id"] == "post-prepare")
+        self.assertEqual(unchanged["lowering_members"], ["prepare"])
+        self.assertEqual(unchanged["accepted_fusion_events"], [])
+        self.assertTrue(unchanged["path"])
+
+    def test_every_remaining_scheduler_class_has_one_dashed_boundary(self):
+        capture = copy.deepcopy(self.capture)
+        final = capture["stages"]["fusion"]["scheduler_nodes"]
+        final.append(scheduler_group("post-foreach", ["foreach-leaf"], ["unmapped"]))
+        classes = ["SchedulerNode", "FusedSchedulerNode", "ExternKernelSchedulerNode", "NopKernelSchedulerNode", "ForeachKernelSchedulerNode"]
+        for node, name in zip(final, classes):
+            node["class"] = name
+        before = copy.deepcopy(capture)
+        artifacts = render_capture(capture=capture, output_dir=Path(self.output.name) / "all_classes")
+        payload = json.loads(Path(artifacts["payload"]).read_text())
+        expected = {node["id"]: node["class"] for node in final}
+        self.assertEqual({group["id"]: group["class"] for group in payload["fusion_groups"]}, expected)
+        self.assertEqual(artifacts["fusion_region_count"], len(final))
+        svg = ET.parse(artifacts["svg"])
+        outlined = {}
+        for element in svg.iter():
+            if element.attrib.get("class") != "fusion-boundary":
+                continue
+            paths = element.findall("{http://www.w3.org/2000/svg}path")
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(paths[0].attrib["stroke-dasharray"], "11 6")
+            outlined[element.attrib["data-scheduler"]] = element.attrib["data-scheduler-class"]
+        self.assertEqual(outlined, expected)
+        unknown = next(group for group in payload["fusion_groups"] if group["id"] == "post-unknown")
+        self.assertEqual(unknown["member_fx_ids"], [])
+        self.assertEqual(unknown["matmul_fx_ids"], [])
+        self.assertEqual(unknown["unknown_fx_ids"], ["unmapped"])
+        self.assertEqual(unknown["geometry_status"], "unmapped_or_empty")
+        self.assertEqual(unknown["contour_method"], "unmapped scheduler marker")
+        data = decode_widget_viewers(Path(artifacts["widget"]).read_text())[0]["data"]
+        self.assertEqual({group["id"]: group["class"] for group in data["fusion_groups"]}, expected)
+        self.assertIn("After-fusion boundaries 5", data["summary"])
+        self.assertEqual(capture, before)
+
+    def test_matmul_labels_count_computation_and_keep_exact_fused_members(self):
+        capture = copy.deepcopy(self.capture)
+        for stage in ("lowering", "fusion"):
+            capture["stages"][stage]["scheduler_nodes"][0]["indexing_fx_ids"] = ["right_mm"]
+        artifacts = render_capture(capture=capture, output_dir=Path(self.output.name) / "matmul_members")
+        payload = json.loads(Path(artifacts["payload"]).read_text())
+        groups = {group["id"]: group for group in payload["fusion_groups"]}
+        self.assertEqual(groups["unrelated-fused-name"]["matmul_fx_ids"], ["left_mm"])
+        self.assertEqual(groups["post-right"]["matmul_fx_ids"], ["right_mm"])
+        self.assertEqual(groups["post-prepare"]["matmul_fx_ids"], [])
+        self.assertIn("right_mm", groups["post-prepare"]["indexing_fx_ids"])
+        svg = ET.parse(artifacts["svg"])
+        labels = {element.attrib["data-scheduler"]: element.find("{http://www.w3.org/2000/svg}text").text for element in svg.iter() if element.attrib.get("class") == "fusion-boundary region-label"}
+        self.assertTrue(labels["unrelated-fused-name"].endswith("MM 1"))
+        self.assertTrue(labels["post-right"].endswith("MM 1"))
+        self.assertTrue(labels["post-prepare"].endswith("MM 0"))
+        data = decode_widget_viewers(Path(artifacts["widget"]).read_text())[0]["data"]
+        self.assertEqual({group["id"]: group["matmul_fx_ids"] for group in data["fusion_groups"]}, {name: group["matmul_fx_ids"] for name, group in groups.items()})
 
     def test_saved_capture_widget_preserves_members_edges_and_local_ids(self):
         previous_ids = set()
