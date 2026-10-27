@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from .lazy import inlined_pointwise_proofs
+
+
+EXECUTION_ANNOTATION_VERSION = 4
+
 
 _VIEW_SOURCE_NAMES = {
     "view", "_unsafe_view", "permute", "expand", "squeeze", "unsqueeze",
@@ -264,6 +269,14 @@ class _ExecutionAnnotator:
                             pending.extend(self.children[actual])
         return proofs
 
+    def native_bias_roots(self, name):
+        node = self.fx[name]
+        if node.get("target") not in {"aten.addmm.default", "aten.baddbmm.default", "aten.addmv.default"}:
+            return []
+        if node.get("kwargs", {}).get("beta", 1) == 0:
+            return []
+        return self.references(node.get("args", [])[:1])
+
     def annotate_leaf(self, name):
         leaf = self.leaves[name]
         own_buffers = set(leaf["buffer_names"])
@@ -279,6 +292,7 @@ class _ExecutionAnnotator:
             root_method = "direct matmul roots proven by actual loop product/reduction IR"
         visited, indexing, unknown_names = set(), set(), set()
         cuts, issues = [], []
+        pointwise_roots = set()
         direct_ids = self.source_ids(roots)
 
         def walk(fx_name, is_root=False):
@@ -293,9 +307,14 @@ class _ExecutionAnnotator:
                 issues.append({"kind": "missing_final_ir_binding", "fx": fx_name})
                 return
             routes = ir_routes(entry["value"])
-            buffers = {buffer for route in routes for buffer in route.get("buffer_names", [])}
+            final_buffers = {buffer for route in routes for buffer in route.get("buffer_names", [])}
             matmul_buffers = self.native_materialized_buffers.get(fx_name, set())
-            buffers |= matmul_buffers
+            buffers = final_buffers
+            # Only the dot stage owns the native intermediate reduction buffers.
+            if is_root and fx_name in matmul_roots:
+                buffers = matmul_buffers & own_buffers
+            elif not buffers:
+                buffers = matmul_buffers
             external = buffers - own_buffers
             metadata = self.is_indexing(fx_name)
             if metadata:
@@ -315,6 +334,8 @@ class _ExecutionAnnotator:
                     walk(parent, is_root=is_root and entry["value"].get("type") not in {"tuple", "list", "dict"})
                 return
             if external and (not is_root or matmul_buffers - own_buffers):
+                if not final_buffers and external & matmul_buffers & read_buffers & loaded_buffers:
+                    pointwise_roots.update(self.native_bias_roots(fx_name))
                 for buffer in sorted(external):
                     cuts.append({"fx": fx_name, "buffer": buffer, "owner": sorted(self.buffer_owners.get(buffer, [])), "matched_read_dependency": buffer in read_buffers})
                 if external - read_buffers:
@@ -334,6 +355,13 @@ class _ExecutionAnnotator:
                 for buffer in sorted(split_inputs):
                     cuts.append({"fx": fx_name, "buffer": buffer, "owner": sorted(self.buffer_owners[buffer]),
                                  "matched_read_dependency": True, "kind": "same_fx_split_stage"})
+                if split_inputs & matmul_buffers and fx_name not in matmul_roots:
+                    pointwise_roots.update(self.native_bias_roots(fx_name))
+                    unknown_names.add(fx_name)
+                    issues.append({"kind": "matmul_result_conversion_after_materialized_reduction", "fx": fx_name,
+                                   "reduction_buffers": sorted(split_inputs & matmul_buffers),
+                                   "note": "This stage finalizes a materialized native matmul result; lazy bias contributions require their own body evidence."})
+                    return
                 other_inputs = (read_buffers | loaded_buffers) - own_buffers - split_inputs
                 if not other_inputs:
                     return
@@ -373,6 +401,12 @@ class _ExecutionAnnotator:
         cast_ids = {key for proof in cast_proofs for key in proof["execution_fx_ids"]}
         executed |= cast_ids
         unknown -= cast_ids
+        pointwise_proofs = inlined_pointwise_proofs(leaf=leaf, roots=sorted(pointwise_roots), fx=self.fx,
+                                                   values=self.values, parents=self.parents,
+                                                   graph_id=self.graph_id, source_ids=self.source_ids)
+        pointwise_ids = {key for proof in pointwise_proofs for key in proof["execution_fx_ids"]}
+        executed |= pointwise_ids
+        unknown -= pointwise_ids
         evidence = {"method": "walk actual transformed FX from actual loop/template roots; stop at other named materialized buffers",
                     "root_method": root_method, "actual_root_fx_names": roots,
                     "actual_loop_body_available": bool(leaf.get("loop_body")),
@@ -383,6 +417,7 @@ class _ExecutionAnnotator:
                     "unknown_fx_ids": ordered_ids(unknown), "uncertainties": issues,
                     "direct_lazy_body_proofs": direct_body_proofs,
                     "inlined_cast_proofs": cast_proofs,
+                    "inlined_pointwise_proofs": pointwise_proofs,
                     "native_dot_reduction_proofs": native_proofs,
                     "excluded_ancestry_fx_ids": ordered_ids(set(leaf["origin_fx_ids"]) - executed - indexed),
                     "certainty": "partial" if issues else "observed IR boundaries",
@@ -494,9 +529,12 @@ class _ExecutionAnnotator:
                                                        if key in proof["execution_fx_ids"]],
                            "inlined_cast_proofs": [proof for annotation in self.annotations.values()
                                                    for proof in annotation["execution_evidence"]["inlined_cast_proofs"]
-                                                   if key in proof["execution_fx_ids"]]}
+                                                   if key in proof["execution_fx_ids"]],
+                           "inlined_pointwise_proofs": [proof for annotation in self.annotations.values()
+                                                       for proof in annotation["execution_evidence"]["inlined_pointwise_proofs"]
+                                                       if key in proof["execution_fx_ids"]]}
         self.capture["fx_status"] = status
-        self.capture["execution_annotation"] = {"version": 3, "method": "actual final IR bindings + owned intermediate buffer dependencies + captured lazy cast dataflow + actual transformed FX argument DAG + exact pre-fusion member union",
+        self.capture["execution_annotation"] = {"version": EXECUTION_ANNOTATION_VERSION, "method": "actual final IR bindings + owned native split buffers + live lazy Pointwise dataflow + actual transformed FX argument DAG + exact pre-fusion member union",
                                                 "never_use_origin_sets_as_execution": True, "original_indexing_fx_ids": ordered_ids(self.original_indexing),
                                                 "unknown_original_compute_fx_ids": ordered_ids(key for key, value in status.items() if value["role"] == "unknown"),
                                                 "not_an_exclusive_partition": True}

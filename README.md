@@ -137,3 +137,10 @@ are available. The core viewer and capture API run independently of BB.
 
 MIT. This package was extracted from the FX visualizer developed alongside
 [Better Benchmark](https://github.com/eellison/better-benchmark). See [LICENSE](LICENSE).
+
+
+### Recovered FX views of a full model schedule
+
+`project_capture(source_capture=..., original_graph=..., fx_mapping=..., fusion_nodes=...)` projects recorded scheduler memberships onto a recovered FX graph. `fx_mapping` maps source FX IDs to recovered FX IDs. Scheduler classes, operation names, dependencies and LoopBody IR come from the original full model compilation. The recovered region is not compiled again.
+
+Saved projections retain a checksum of the full compiler capture. Rendering replays and verifies the projection against that source; changed scheduler facts or source files are rejected. Native scopes can specify the exact anchor and producer/consumer scheduler IDs. Template scopes include recorded nodes contributing to the recovered FX operations. Scope boundaries can truncate a full scheduler, which is marked partial. Matmul labels use actual matmul leaves so bias finalization cannot become an additional dot.

@@ -417,13 +417,19 @@ def _read_capture(capture):
 
 def render_capture(*, capture, output_dir, title=None, clustered=True):
     """Render original FX and recorded scheduler evidence without PyTorch."""
+    from .execution import EXECUTION_ANNOTATION_VERSION
+
     capture = _read_capture(capture)
     groups = [node for stage in ("lowering", "fusion") for node in capture["stages"][stage]["scheduler_nodes"]]
     saved_schedule = capture.get("compile", {}).get("mode") == "schedule_only" and any(
         "loop_ir" in leaf for node in capture["stages"]["lowering"]["scheduler_nodes"] for leaf in node.get("leaf_members", [])
     )
-    stale_annotation = capture.get("execution_annotation", {}).get("version", 0) < 3 and bool(capture["stages"]["lowering"].get("final_ir_values"))
-    if saved_schedule or stale_annotation or (not capture.get("execution_annotation") and any("execution_fx_ids" not in node or "indexing_fx_ids" not in node for node in groups)):
+    stale_annotation = capture.get("execution_annotation", {}).get("version", 0) < EXECUTION_ANNOTATION_VERSION and bool(capture["stages"]["lowering"].get("final_ir_values"))
+    if capture.get("source_projection"):
+        from .projection import replay_projection
+
+        capture = replay_projection(capture)
+    elif saved_schedule or stale_annotation or (not capture.get("execution_annotation") and any("execution_fx_ids" not in node or "indexing_fx_ids" not in node for node in groups)):
         from .execution import annotate_scheduler_execution
 
         capture = copy.deepcopy(capture)

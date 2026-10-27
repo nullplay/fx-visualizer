@@ -351,7 +351,7 @@ class TestSchedulerExecution(unittest.TestCase):
             }) as layout, patch("fx_visualizer.rendering._build_widget", return_value="<section>Viewer</section>"):
                 result = render_capture(capture=source, output_dir=Path(temporary) / "replay")
             replay = json.loads(Path(result["capture"]).read_text())
-            self.assertEqual(replay["execution_annotation"]["version"], 3)
+            self.assertEqual(replay["execution_annotation"]["version"], 4)
             self.assertEqual(replay["stages"]["lowering"]["scheduler_nodes"][1]["execution_fx_ids"], ["n2"])
             self.assertEqual(layout.call_args.args[0]["stages"]["lowering"]["scheduler_nodes"][1]["execution_fx_ids"], ["n2"])
             self.assertEqual(json.loads(source.read_text()), capture)
